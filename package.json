@@ -1,0 +1,12 @@
+{
+  "name": "mcp-hub",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Umbrella worker for the MCP portfolio: master landing page, live status (cron-pinged every 5 min), Terms / Privacy / Refund / Support pages, SEO files.",
+  "type": "module",
+  "main": "src/index.ts",
+  "scripts": { "dev": "wrangler dev", "deploy": "wrangler deploy", "typecheck": "tsc --noEmit", "tail": "wrangler tail" },
+  "author": "Prakhar Gupta <prakshatechnologies@gmail.com>",
+  "license": "MIT",
+  "devDependencies": { "@cloudflare/workers-types": "^4.20260101.0", "typescript": "^5.5.0", "wrangler": "^3.80.0" }
+}

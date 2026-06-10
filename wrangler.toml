@@ -1,0 +1,15 @@
+name = "mcp-hub"
+main = "src/index.ts"
+compatibility_date = "2026-01-01"
+compatibility_flags = ["nodejs_compat"]
+
+[observability]
+enabled = true
+
+[[kv_namespaces]]
+binding = "STATUS_KV"
+id = "52045936a14c405ea446f1722f60827b"
+
+# Cron trigger — ping all 16 products every 5 minutes.
+[triggers]
+crons = ["*/5 * * * *"]
