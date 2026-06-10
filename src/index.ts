@@ -62,7 +62,7 @@ const PRODUCTS = [
   { slug: "hsn-classifier-mcp",             name: "HSN Classifier",            tagline: "Look up Indian HSN/GST codes by description or product name. 4,676 entries embedded.",                                  tier: "$9 / $29 / $79",    priceFrom: 9,   group: "India" },
 ] as const;
 
-const CF_SUBDOMAIN = "prakhar-cognizance";
+const CF_SUBDOMAIN = "atlasword";
 const HUB_URL = `https://mcp-hub.${CF_SUBDOMAIN}.workers.dev`;
 
 // Bundle catalog — pre-Dodo, waitlist-only. Pricing here is indicative.

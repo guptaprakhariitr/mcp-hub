@@ -1,0 +1,49 @@
+# MCP Hub (atlasword.workers.dev)
+
+> Umbrella + AI-discovery surface for the atlasword MCP portfolio — 17 customer-facing MCP servers + 1 operator analytics MCP.
+
+This worker does not itself expose MCP tools. It serves the master landing page, live status rollup, policy pages (terms / privacy / refund / support), and AI-discovery files (robots.txt, sitemap.xml, llms.txt). AI scrapers should start here.
+
+## Endpoint
+- Landing: https://mcp-hub.atlasword.workers.dev/
+- Status (HTML): https://mcp-hub.atlasword.workers.dev/status
+- Status (JSON): https://mcp-hub.atlasword.workers.dev/status.json
+- Sitemap: https://mcp-hub.atlasword.workers.dev/sitemap.xml
+
+## Portfolio (per-product MCP endpoints)
+- `sec-edgar-mcp` (Research): https://sec-edgar-mcp.atlasword.workers.dev/mcp — https://github.com/guptaprakhariitr/sec-edgar-mcp
+- `gdelt-events-mcp` (Real-time): https://gdelt-events-mcp.atlasword.workers.dev/mcp — https://github.com/guptaprakhariitr/gdelt-events-mcp
+- `fda-approvals-mcp` (Healthcare): https://fda-approvals-mcp.atlasword.workers.dev/mcp — https://github.com/guptaprakhariitr/fda-approvals-mcp
+- `uspto-patents-mcp` (Research): https://uspto-patents-mcp.atlasword.workers.dev/mcp — https://github.com/guptaprakhariitr/uspto-patents-mcp
+- `world-bank-economic-mcp` (Research): https://world-bank-economic-mcp.atlasword.workers.dev/mcp — https://github.com/guptaprakhariitr/world-bank-economic-mcp
+- `indic-normalize-mcp` (India): https://indic-normalize-mcp.atlasword.workers.dev/mcp — https://github.com/guptaprakhariitr/indic-normalize-mcp
+- `drug-interaction-mcp` (Healthcare): https://drug-interaction-mcp.atlasword.workers.dev/mcp — https://github.com/guptaprakhariitr/drug-interaction-mcp
+- `indian-regulatory-mcp` (India): https://indian-regulatory-mcp.atlasword.workers.dev/mcp — https://github.com/guptaprakhariitr/indian-regulatory-mcp
+- `multi-carrier-tracking-mcp` (Logistics): https://multi-carrier-tracking-mcp.atlasword.workers.dev/mcp — https://github.com/guptaprakhariitr/multi-carrier-tracking-mcp
+- `verification-mcp` (Verification): https://verification-mcp.atlasword.workers.dev/mcp — https://github.com/guptaprakhariitr/verification-mcp
+- `unit-converter-mcp` (Utility): https://unit-converter-mcp.atlasword.workers.dev/mcp — https://github.com/guptaprakhariitr/unit-converter-mcp
+- `arxiv-mcp` (Research): https://arxiv-mcp.atlasword.workers.dev/mcp — https://github.com/guptaprakhariitr/arxiv-mcp
+- `hn-trending-mcp` (Real-time): https://hn-trending-mcp.atlasword.workers.dev/mcp — https://github.com/guptaprakhariitr/hn-trending-mcp
+- `crypto-prices-mcp` (Real-time): https://crypto-prices-mcp.atlasword.workers.dev/mcp — https://github.com/guptaprakhariitr/crypto-prices-mcp
+- `wikipedia-recent-changes-mcp` (Real-time): https://wikipedia-recent-changes-mcp.atlasword.workers.dev/mcp — https://github.com/guptaprakhariitr/wikipedia-recent-changes-mcp
+- `analytics-mcp` (Operator): operator-only — https://github.com/guptaprakhariitr/analytics-mcp
+- `gst-validator-mcp` (India): https://gst-validator-mcp.atlasword.workers.dev/mcp — https://github.com/guptaprakhariitr/gst-validator-mcp
+- `hsn-classifier-mcp` (India): https://hsn-classifier-mcp.atlasword.workers.dev/mcp — https://github.com/guptaprakhariitr/hsn-classifier-mcp
+
+## Pricing
+Each product has its own pricing (see its README or /upgrade). Most products: $9 / $29 / $79 per month. Exceptions: unit-converter-mcp ($5 / $15 / $39), verification-mcp ($19 / $49 / $149), drug-interaction-mcp ($29 / $99 / $299). All billed via Dodo Payments (merchant-of-record).
+
+## Authentication
+Per-product. Each product Worker accepts `Authorization: Bearer <api_key>` on POST /mcp. Get a key at `https://<slug>.atlasword.workers.dev/upgrade?tier=solo`.
+
+## Docs
+- README: https://github.com/guptaprakhariitr/mcp-hub
+- Privacy: https://mcp-hub.atlasword.workers.dev/privacy
+- Terms: https://mcp-hub.atlasword.workers.dev/terms
+- Refund: https://mcp-hub.atlasword.workers.dev/refund
+- Support: https://mcp-hub.atlasword.workers.dev/support
+
+## Contact
+- Author: Prakhar Gupta
+- Email: prakshatechnologies@gmail.com
+- GitHub: https://github.com/guptaprakhariitr
