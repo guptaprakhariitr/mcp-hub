@@ -10,6 +10,82 @@ enabled = true
 binding = "STATUS_KV"
 id = "52045936a14c405ea446f1722f60827b"
 
-# Cron trigger — ping all 16 products every 5 minutes.
+# Cron trigger — ping all 18 products every 5 minutes.
 [triggers]
 crons = ["*/5 * * * *"]
+
+# Service bindings to every sibling product Worker. Required because
+# intra-account `*.workers.dev` fetches are intercepted by the CF edge and
+# return 404 with ~20ms latency. Service bindings bypass the edge and
+# dispatch directly to the target Worker.
+[[services]]
+binding = "PROD_SEC_EDGAR_MCP"
+service = "sec-edgar-mcp"
+
+[[services]]
+binding = "PROD_GDELT_EVENTS_MCP"
+service = "gdelt-events-mcp"
+
+[[services]]
+binding = "PROD_FDA_APPROVALS_MCP"
+service = "fda-approvals-mcp"
+
+[[services]]
+binding = "PROD_USPTO_PATENTS_MCP"
+service = "uspto-patents-mcp"
+
+[[services]]
+binding = "PROD_WORLD_BANK_ECONOMIC_MCP"
+service = "world-bank-economic-mcp"
+
+[[services]]
+binding = "PROD_INDIC_NORMALIZE_MCP"
+service = "indic-normalize-mcp"
+
+[[services]]
+binding = "PROD_DRUG_INTERACTION_MCP"
+service = "drug-interaction-mcp"
+
+[[services]]
+binding = "PROD_INDIAN_REGULATORY_MCP"
+service = "indian-regulatory-mcp"
+
+[[services]]
+binding = "PROD_MULTI_CARRIER_TRACKING_MCP"
+service = "multi-carrier-tracking-mcp"
+
+[[services]]
+binding = "PROD_VERIFICATION_MCP"
+service = "verification-mcp"
+
+[[services]]
+binding = "PROD_UNIT_CONVERTER_MCP"
+service = "unit-converter-mcp"
+
+[[services]]
+binding = "PROD_ARXIV_MCP"
+service = "arxiv-mcp"
+
+[[services]]
+binding = "PROD_HN_TRENDING_MCP"
+service = "hn-trending-mcp"
+
+[[services]]
+binding = "PROD_CRYPTO_PRICES_MCP"
+service = "crypto-prices-mcp"
+
+[[services]]
+binding = "PROD_WIKIPEDIA_RECENT_CHANGES_MCP"
+service = "wikipedia-recent-changes-mcp"
+
+[[services]]
+binding = "PROD_ANALYTICS_MCP"
+service = "analytics-mcp"
+
+[[services]]
+binding = "PROD_GST_VALIDATOR_MCP"
+service = "gst-validator-mcp"
+
+[[services]]
+binding = "PROD_HSN_CLASSIFIER_MCP"
+service = "hsn-classifier-mcp"

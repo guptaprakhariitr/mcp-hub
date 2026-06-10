@@ -15,6 +15,29 @@
 
 export interface Env {
   STATUS_KV: KVNamespace;
+  // Service bindings to all 18 product Workers. Intra-account `workers.dev`
+  // fetches are intercepted by the CF edge and return 404, so the cron
+  // pings products via service bindings instead.
+  PROD_SEC_EDGAR_MCP: Fetcher;
+  PROD_GDELT_EVENTS_MCP: Fetcher;
+  PROD_FDA_APPROVALS_MCP: Fetcher;
+  PROD_USPTO_PATENTS_MCP: Fetcher;
+  PROD_WORLD_BANK_ECONOMIC_MCP: Fetcher;
+  PROD_INDIC_NORMALIZE_MCP: Fetcher;
+  PROD_DRUG_INTERACTION_MCP: Fetcher;
+  PROD_INDIAN_REGULATORY_MCP: Fetcher;
+  PROD_MULTI_CARRIER_TRACKING_MCP: Fetcher;
+  PROD_VERIFICATION_MCP: Fetcher;
+  PROD_UNIT_CONVERTER_MCP: Fetcher;
+  PROD_ARXIV_MCP: Fetcher;
+  PROD_HN_TRENDING_MCP: Fetcher;
+  PROD_CRYPTO_PRICES_MCP: Fetcher;
+  PROD_WIKIPEDIA_RECENT_CHANGES_MCP: Fetcher;
+  PROD_ANALYTICS_MCP: Fetcher;
+  PROD_GST_VALIDATOR_MCP: Fetcher;
+  PROD_HSN_CLASSIFIER_MCP: Fetcher;
+  // Operator-only secret guarding GET /cron/run (manual cron invocation).
+  CRON_DEBUG_SECRET?: string;
 }
 
 const PRODUCTS = [
@@ -34,6 +57,8 @@ const PRODUCTS = [
   { slug: "crypto-prices-mcp",              name: "Crypto Prices",             tagline: "Live + historical cryptocurrency prices via CoinGecko's free API.",                                                    tier: "$9 / $29 / $79",     group: "Real-time" },
   { slug: "wikipedia-recent-changes-mcp",   name: "Wikipedia Recent Changes",  tagline: "Live Wikipedia edit feed + page summaries + trending + Wikidata search.",                                              tier: "$9 / $29 / $79",     group: "Real-time" },
   { slug: "analytics-mcp",                  name: "Analytics (operator-only)", tagline: "Portfolio analytics across all 15 products. Operator-only.",                                                           tier: "internal",            group: "Operator" },
+  { slug: "gst-validator-mcp",              name: "GST Validator",             tagline: "Validate Indian GSTINs locally (Verhoeff checksum), extract PAN, identify state.",                                     tier: "$9 / $29 / $79",     group: "India" },
+  { slug: "hsn-classifier-mcp",             name: "HSN Classifier",            tagline: "Look up Indian HSN/GST codes by description or product name. 4,676 entries embedded.",                                  tier: "$9 / $29 / $79",     group: "India" },
 ] as const;
 
 const CF_SUBDOMAIN = "prakhar-cognizance";
@@ -46,6 +71,11 @@ export default {
     if (request.method === "GET" && p === "/")             return html(landingPage());
     if (request.method === "GET" && p === "/status")       return html(await statusPage(env));
     if (request.method === "GET" && p === "/status.json")  return json(await readStatus(env));
+    if (request.method === "GET" && p === "/cron/run") {
+      const secret = request.headers.get("x-cron-secret") ?? new URL(request.url).searchParams.get("secret");
+      if (!env.CRON_DEBUG_SECRET || secret !== env.CRON_DEBUG_SECRET) return new Response("Not Found", { status: 404 });
+      return json(await runHealthCheck(env));
+    }
     if (request.method === "GET" && p === "/terms")        return html(termsPage());
     if (request.method === "GET" && p === "/privacy")      return html(privacyPage());
     if (request.method === "GET" && p === "/refund")       return html(refundPage());
@@ -58,25 +88,43 @@ export default {
 
   /** Triggered by Cron every 5 minutes. Pings each product's /health endpoint, writes to KV. */
   async scheduled(_event: ScheduledEvent, env: Env, _ctx: ExecutionContext): Promise<void> {
-    const results = await Promise.all(PRODUCTS.map(async (p) => {
-      const url = `https://${p.slug}.${CF_SUBDOMAIN}.workers.dev/health`;
-      const start = Date.now();
-      try {
-        const r = await fetch(url, { method: "GET", signal: AbortSignal.timeout(5000) });
-        return { slug: p.slug, ok: r.ok, status: r.status, latency_ms: Date.now() - start };
-      } catch (e: any) {
-        return { slug: p.slug, ok: false, status: 0, latency_ms: Date.now() - start, error: e?.message ?? "fetch error" };
-      }
-    }));
-    const snapshot = { checked_at: new Date().toISOString(), results };
-    await env.STATUS_KV.put("status:latest", JSON.stringify(snapshot), { expirationTtl: 60 * 60 * 24 });
-    // Keep a rolling history (last 288 = 24h at 5-min cadence).
-    const history = JSON.parse((await env.STATUS_KV.get("status:history")) || "[]");
-    history.push(snapshot);
-    if (history.length > 288) history.shift();
-    await env.STATUS_KV.put("status:history", JSON.stringify(history), { expirationTtl: 60 * 60 * 24 * 7 });
+    await runHealthCheck(env);
   },
 };
+
+/** Ping every product's /health via its service binding and persist to KV. */
+async function runHealthCheck(env: Env): Promise<{ checked_at: string; results: HealthResult[] }> {
+  const results = await Promise.all(PRODUCTS.map(async (p) => {
+    const bindingName = `PROD_${p.slug.toUpperCase().replace(/-/g, "_")}`;
+    const binding = (env as unknown as Record<string, Fetcher>)[bindingName];
+    const start = Date.now();
+    if (!binding || typeof binding.fetch !== "function") {
+      return { slug: p.slug, ok: false, status: 0, latency_ms: 0, error: `missing service binding ${bindingName}` };
+    }
+    try {
+      const r = await binding.fetch(new Request("https://internal/health", { method: "GET", signal: AbortSignal.timeout(5000) }));
+      return { slug: p.slug, ok: r.ok, status: r.status, latency_ms: Date.now() - start };
+    } catch (e: any) {
+      return { slug: p.slug, ok: false, status: 0, latency_ms: Date.now() - start, error: e?.message ?? "fetch error" };
+    }
+  }));
+  const snapshot = { checked_at: new Date().toISOString(), results };
+  await env.STATUS_KV.put("status:latest", JSON.stringify(snapshot), { expirationTtl: 60 * 60 * 24 });
+  // Keep a rolling history (last 288 = 24h at 5-min cadence).
+  const history = JSON.parse((await env.STATUS_KV.get("status:history")) || "[]");
+  history.push(snapshot);
+  if (history.length > 288) history.shift();
+  await env.STATUS_KV.put("status:history", JSON.stringify(history), { expirationTtl: 60 * 60 * 24 * 7 });
+  return snapshot;
+}
+
+interface HealthResult {
+  slug: string;
+  ok: boolean;
+  status: number;
+  latency_ms: number;
+  error?: string;
+}
 
 async function readStatus(env: Env): Promise<any> {
   const latest = JSON.parse((await env.STATUS_KV.get("status:latest")) || "null");
