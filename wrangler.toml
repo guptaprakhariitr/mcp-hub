@@ -10,12 +10,15 @@ enabled = true
 binding = "STATUS_KV"
 id = "52045936a14c405ea446f1722f60827b"
 
-# R2 bucket for daily KV → R2 backups (cron 0 3 * * *).
-# Uncomment after enabling R2 in the Cloudflare Dashboard
-# (Storage → R2 → Enable). Bucket is created via:
-#   npx wrangler@latest r2 bucket create mcp-portfolio-backups
-# Until R2 is enabled, the cron handler skips uploads gracefully (the code
-# checks for env.BACKUPS at runtime).
+# Daily backups now commit to a private GitHub repo (no R2 / no card on file).
+# The PAT lives in the GITHUB_PAT secret (`wrangler secret put GITHUB_PAT`).
+[vars]
+BACKUP_REPO_OWNER = "guptaprakhariitr"
+BACKUP_REPO_NAME = "mcp-portfolio-backups"
+
+# Optional R2 fallback. Disabled by default — requires a card on file for R2.
+# To enable: `npx wrangler r2 bucket create mcp-portfolio-backups`, then
+# uncomment. The code will mirror to R2 if env.BACKUPS is bound.
 # [[r2_buckets]]
 # binding = "BACKUPS"
 # bucket_name = "mcp-portfolio-backups"

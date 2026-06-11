@@ -16,8 +16,15 @@
 
 export interface Env {
   STATUS_KV: KVNamespace;
-  // R2 bucket for daily KV → R2 backups (cron 0 3 * * *).
+  // Optional R2 bucket for daily KV backups (legacy/fallback). Primary
+  // backup target is now a private GitHub repo (see GITHUB_PAT below).
   BACKUPS?: R2Bucket;
+  // Primary backup destination: a private GitHub repo. Daily cron fans out to
+  // every product's admin endpoints, gzips the JSON, base64-encodes it, and
+  // commits one file per product to backups/YYYY-MM-DD/<slug>.json.gz.b64.
+  GITHUB_PAT?: string;
+  BACKUP_REPO_OWNER?: string;
+  BACKUP_REPO_NAME?: string;
   // Service bindings to all 18 product Workers. Intra-account `workers.dev`
   // fetches are intercepted by the CF edge and return 404, so the cron
   // pings products via service bindings instead.
@@ -740,32 +747,51 @@ function adminLandingPage(): string {
   <li><a href="/admin/support"><code>/admin/support</code></a> — pending support tickets across the portfolio.</li>
   <li><a href="/admin/events"><code>/admin/events</code></a> — recent webhook event log.</li>
   <li><a href="/admin/stats"><code>/admin/stats</code></a> — subscriber counts per tier + monthly revenue estimate.</li>
-  <li><a href="/admin/backup-now"><code>/admin/backup-now</code></a> — manually run the daily KV → R2 backup.</li>
+  <li><a href="/admin/backup-now"><code>/admin/backup-now</code></a> — manually run the daily backup (writes to GitHub).</li>
 </ul>
 <h2>Daily backup</h2>
-<p>Cron <code>0 3 * * *</code> dumps each product's KV (keys / support tickets / events) to R2 bucket <code>mcp-portfolio-backups</code> as <code>backups/YYYY-MM-DD/&lt;slug&gt;.json.gz</code>. 30-day rolling retention.</p>
+<p>Cron <code>0 3 * * *</code> dumps each product's KV (keys / support tickets / events) and commits one file per product to the private GitHub repo <code>guptaprakhariitr/mcp-portfolio-backups</code> at <code>backups/YYYY-MM-DD/&lt;slug&gt;.json.gz.b64</code> (gzipped JSON, base64-wrapped). If R2 is also bound, it mirrors there too.</p>
 `);
 }
 
-// ── R2 backup ────────────────────────────────────────────────────────────────
+// ── Daily backup (GitHub primary, R2 fallback) ───────────────────────────────
+//
+// Primary: commit one base64-encoded gzipped JSON file per product to a
+// private GitHub repo at backups/YYYY-MM-DD/<slug>.json.gz.b64. The base64
+// wrapper is required because the GitHub Contents API only accepts UTF-8 or
+// base64 content — raw gzipped bytes are not valid UTF-8.
+//
+// Fallback: if env.BACKUPS (R2) is bound, also upload the raw .json.gz blob
+// to R2 in parallel. R2 is not required.
+
+interface BackupItem {
+  slug: string;
+  key: string;
+  bytes: number;
+  ok: boolean;
+  destination: "github" | "r2";
+  error?: string;
+  commit_sha?: string;
+  commit_url?: string;
+}
 
 interface BackupResult {
   ran_at: string;
   date: string;
-  uploaded: Array<{ slug: string; key: string; bytes: number; ok: boolean; error?: string }>;
+  uploaded: BackupItem[];
   skipped_reason?: string;
 }
 
 async function runDailyBackup(env: Env): Promise<BackupResult> {
   const date = new Date().toISOString().slice(0, 10);
   const ran_at = new Date().toISOString();
-  if (!env.BACKUPS) {
-    return { ran_at, date, uploaded: [], skipped_reason: "BACKUPS R2 binding not configured" };
-  }
   if (!env.ADMIN_TOKEN) {
     return { ran_at, date, uploaded: [], skipped_reason: "ADMIN_TOKEN secret missing" };
   }
-  const uploaded: BackupResult["uploaded"] = [];
+  if (!env.GITHUB_PAT || !env.BACKUP_REPO_OWNER || !env.BACKUP_REPO_NAME) {
+    return { ran_at, date, uploaded: [], skipped_reason: "GitHub backup not configured (need GITHUB_PAT + BACKUP_REPO_OWNER + BACKUP_REPO_NAME)" };
+  }
+  const uploaded: BackupItem[] = [];
   for (const slug of ADMIN_FANOUT_SLUGS) {
     const [keys, support, events] = await Promise.all([
       fanoutOne(env, slug, "/admin/list-keys"),
@@ -780,14 +806,28 @@ async function runDailyBackup(env: Env): Promise<BackupResult> {
       events: events.body ?? { error: events.error },
     });
     const gz = await gzipString(payload);
-    const objectKey = `backups/${date}/${slug}.json.gz`;
+    const b64 = bytesToBase64(gz);
+
+    // Primary: GitHub commit.
+    const ghPath = `backups/${date}/${slug}.json.gz.b64`;
     try {
-      await env.BACKUPS.put(objectKey, gz, {
-        httpMetadata: { contentType: "application/json", contentEncoding: "gzip" },
-      });
-      uploaded.push({ slug, key: objectKey, bytes: gz.byteLength, ok: true });
+      const commit = await githubPutFile(env, ghPath, b64, `backup: ${slug} ${date}`);
+      uploaded.push({ slug, key: ghPath, bytes: b64.length, ok: true, destination: "github", commit_sha: commit.sha, commit_url: commit.html_url });
     } catch (e: any) {
-      uploaded.push({ slug, key: objectKey, bytes: gz.byteLength, ok: false, error: e?.message ?? "r2 put failed" });
+      uploaded.push({ slug, key: ghPath, bytes: b64.length, ok: false, destination: "github", error: e?.message ?? "github commit failed" });
+    }
+
+    // Optional fallback: R2 (only if bound).
+    if (env.BACKUPS) {
+      const r2Key = `backups/${date}/${slug}.json.gz`;
+      try {
+        await env.BACKUPS.put(r2Key, gz, {
+          httpMetadata: { contentType: "application/json", contentEncoding: "gzip" },
+        });
+        uploaded.push({ slug, key: r2Key, bytes: gz.byteLength, ok: true, destination: "r2" });
+      } catch (e: any) {
+        uploaded.push({ slug, key: r2Key, bytes: gz.byteLength, ok: false, destination: "r2", error: e?.message ?? "r2 put failed" });
+      }
     }
   }
   return { ran_at, date, uploaded };
@@ -801,6 +841,68 @@ async function gzipString(s: string): Promise<Uint8Array> {
   void writer.close();
   const buf = await new Response(cs.readable).arrayBuffer();
   return new Uint8Array(buf);
+}
+
+function bytesToBase64(bytes: Uint8Array): string {
+  // btoa works on binary strings; chunk to avoid stack overflow on large bufs.
+  let s = "";
+  const CHUNK = 0x8000;
+  for (let i = 0; i < bytes.length; i += CHUNK) {
+    s += String.fromCharCode.apply(null, Array.from(bytes.subarray(i, i + CHUNK)) as unknown as number[]);
+  }
+  return btoa(s);
+}
+
+/**
+ * PUT /repos/{owner}/{repo}/contents/{path} on GitHub. Creates or updates
+ * the file. Returns the resulting commit metadata.
+ */
+async function githubPutFile(
+  env: Env,
+  path: string,
+  base64Content: string,
+  message: string,
+): Promise<{ sha: string; html_url: string }> {
+  const owner = env.BACKUP_REPO_OWNER!;
+  const repo = env.BACKUP_REPO_NAME!;
+  const apiBase = `https://api.github.com/repos/${owner}/${repo}/contents/${path}`;
+  // If the file already exists for today (re-run of /admin/backup-now), we
+  // need its current sha to overwrite it.
+  let existingSha: string | undefined;
+  const head = await fetch(apiBase, {
+    headers: githubHeaders(env),
+  });
+  if (head.status === 200) {
+    const meta = (await head.json()) as { sha?: string };
+    existingSha = meta.sha;
+  } else if (head.status !== 404) {
+    throw new Error(`GitHub GET ${path} → ${head.status} ${await head.text()}`);
+  }
+  const body: Record<string, unknown> = {
+    message,
+    content: base64Content,
+    committer: { name: "mcp-hub-backup", email: "prakshatechnologies@gmail.com" },
+  };
+  if (existingSha) body.sha = existingSha;
+  const put = await fetch(apiBase, {
+    method: "PUT",
+    headers: { ...githubHeaders(env), "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  if (!put.ok) {
+    throw new Error(`GitHub PUT ${path} → ${put.status} ${await put.text()}`);
+  }
+  const result = (await put.json()) as { commit: { sha: string; html_url: string } };
+  return { sha: result.commit.sha, html_url: result.commit.html_url };
+}
+
+function githubHeaders(env: Env): Record<string, string> {
+  return {
+    Authorization: `Bearer ${env.GITHUB_PAT}`,
+    Accept: "application/vnd.github+json",
+    "X-GitHub-Api-Version": "2022-11-28",
+    "User-Agent": "mcp-hub-backup",
+  };
 }
 
 function sitemapXml(): string {
