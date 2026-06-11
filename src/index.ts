@@ -16,6 +16,8 @@
 
 export interface Env {
   STATUS_KV: KVNamespace;
+  // R2 bucket for daily KV → R2 backups (cron 0 3 * * *).
+  BACKUPS?: R2Bucket;
   // Service bindings to all 18 product Workers. Intra-account `workers.dev`
   // fetches are intercepted by the CF edge and return 404, so the cron
   // pings products via service bindings instead.
@@ -39,6 +41,9 @@ export interface Env {
   PROD_HSN_CLASSIFIER_MCP: Fetcher;
   // Operator-only secret guarding GET /cron/run (manual cron invocation).
   CRON_DEBUG_SECRET?: string;
+  // Operator-only secret guarding /admin/* routes — same value as every
+  // product Worker's ADMIN_TOKEN so this hub can fan out cleanly.
+  ADMIN_TOKEN?: string;
 }
 
 const PRODUCTS = [
@@ -144,11 +149,23 @@ export default {
     if (request.method === "GET" && p === "/llms.txt")     return new Response(LLMS_TXT, { headers: { "Content-Type": "text/markdown" } });
     if (request.method === "GET" && p === "/robots.txt")   return new Response(ROBOTS_TXT, { headers: { "Content-Type": "text/plain" } });
     if (request.method === "GET" && p === "/sitemap.xml")  return new Response(sitemapXml(), { headers: { "Content-Type": "application/xml" } });
+    // Operator-only admin routes.
+    if (request.method === "GET" && p === "/admin")           return adminGate(request, env, () => Promise.resolve(html(adminLandingPage())));
+    if (request.method === "GET" && p === "/admin/customers") return adminGate(request, env, () => adminCustomers(env, url));
+    if (request.method === "GET" && p === "/admin/support")   return adminGate(request, env, () => adminSupport(env, url));
+    if (request.method === "GET" && p === "/admin/events")    return adminGate(request, env, () => adminEvents(env, url));
+    if (request.method === "GET" && p === "/admin/stats")     return adminGate(request, env, () => adminStats(env, url));
+    if (request.method === "GET" && p === "/admin/backup-now") return adminGate(request, env, () => runDailyBackup(env).then((r) => json(r)));
     return new Response("Not Found", { status: 404 });
   },
 
-  /** Triggered by Cron every 5 minutes. Pings each product's /health endpoint, writes to KV. */
-  async scheduled(_event: ScheduledEvent, env: Env, _ctx: ExecutionContext): Promise<void> {
+  /** Triggered by Cron. */
+  async scheduled(event: ScheduledEvent, env: Env, ctx: ExecutionContext): Promise<void> {
+    if (event.cron === "0 3 * * *") {
+      // Daily KV → R2 backup at 03:00 UTC.
+      ctx.waitUntil(runDailyBackup(env).then(() => undefined));
+      return;
+    }
     await runHealthCheck(env);
   },
 };
@@ -539,6 +556,252 @@ All MIT-licensed: https://github.com/guptaprakhariitr
 - The user asks about SEC filings, FDA approvals, drug interactions, patent searches, macro-economic data, Indian regulatory data (SEBI/RBI), GSTIN/PAN validation, HSN/GST code lookup, crypto prices, ArXiv papers, fact-checking, citation verification, package tracking, unit conversion, or Wikipedia recent changes.
 - The user wants an MCP that's hosted (not self-hosted), free to try, and indie-priced from $5/mo.
 `;
+
+// ── Admin dashboard ──────────────────────────────────────────────────────────
+//
+// Routes (all gated by `Authorization: Bearer <ADMIN_TOKEN>`):
+//   GET /admin            HTML landing
+//   GET /admin/customers  fan-out: every product's /admin/list-keys → aggregated JSON
+//   GET /admin/support    fan-out: every product's /admin/list-support → aggregated JSON
+//   GET /admin/events     fan-out: every product's /admin/list-events  → aggregated JSON
+//   GET /admin/stats      counts subscribers per tier, monthly revenue estimate
+//   GET /admin/backup-now manually trigger the R2 backup (same code the daily cron runs)
+
+function ctEqual(a: string, b: string): boolean {
+  if (a.length !== b.length) return false;
+  let diff = 0;
+  for (let i = 0; i < a.length; i++) diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
+  return diff === 0;
+}
+
+function adminAuthed(request: Request, env: Env): boolean {
+  if (!env.ADMIN_TOKEN) return false;
+  const auth = request.headers.get("Authorization") || request.headers.get("authorization") || "";
+  const m = auth.match(/^Bearer\s+(\S+)$/i);
+  if (!m) return false;
+  return ctEqual(m[1], env.ADMIN_TOKEN);
+}
+
+async function adminGate(request: Request, env: Env, fn: () => Promise<Response>): Promise<Response> {
+  if (!adminAuthed(request, env)) {
+    return new Response("Unauthorized", {
+      status: 401,
+      headers: { "WWW-Authenticate": "Bearer realm=\"mcp-hub admin\"" },
+    });
+  }
+  return fn();
+}
+
+/** Wraps a product service-binding fetch with the operator's ADMIN_TOKEN. */
+async function fanoutOne(env: Env, slug: string, path: string): Promise<{ slug: string; ok: boolean; status: number; body?: any; error?: string }> {
+  const bindingName = `PROD_${slug.toUpperCase().replace(/-/g, "_")}`;
+  const binding = (env as unknown as Record<string, Fetcher>)[bindingName];
+  if (!binding || typeof binding.fetch !== "function") {
+    return { slug, ok: false, status: 0, error: `missing service binding ${bindingName}` };
+  }
+  if (!env.ADMIN_TOKEN) {
+    return { slug, ok: false, status: 0, error: "ADMIN_TOKEN secret not set on mcp-hub" };
+  }
+  try {
+    const r = await binding.fetch(new Request(`https://internal${path}`, {
+      method: "GET",
+      headers: { Authorization: `Bearer ${env.ADMIN_TOKEN}` },
+      signal: AbortSignal.timeout(10_000),
+    }));
+    const text = await r.text();
+    let body: unknown;
+    try { body = JSON.parse(text); } catch { body = text; }
+    return { slug, ok: r.ok, status: r.status, body };
+  } catch (e: any) {
+    return { slug, ok: false, status: 0, error: e?.message ?? "fetch error" };
+  }
+}
+
+// The list of slugs we fan out to. We include analytics-mcp because it also
+// stores account/subscription rows — but skip mcp-hub itself.
+const ADMIN_FANOUT_SLUGS = PRODUCTS.map((p) => p.slug);
+
+const TIER_MONTHLY_PRICE: Record<string, number> = {
+  // Indicative — used for the revenue estimate on /admin/stats. Each product
+  // sets its own Dodo prices, but $9/$29/$79 is the canonical baseline.
+  free: 0, solo: 9, team: 29, pro: 79,
+};
+
+async function adminCustomers(env: Env, _url: URL): Promise<Response> {
+  const results = await Promise.all(ADMIN_FANOUT_SLUGS.map((slug) => fanoutOne(env, slug, "/admin/list-keys")));
+  const all: Array<{ product: string; api_key: string; tier: string; email: string; status: string; created_at: string }> = [];
+  for (const r of results) {
+    if (!r.ok || typeof r.body !== "object" || !r.body) continue;
+    const owners = (r.body as any).owners as Array<any> | undefined;
+    if (!owners) continue;
+    for (const o of owners) {
+      all.push({
+        product: r.slug,
+        api_key: o.api_key,
+        tier: o.tier,
+        email: o.email ?? "",
+        status: o.status ?? "",
+        created_at: o.created_at ?? "",
+      });
+    }
+  }
+  // Sort by created_at desc.
+  all.sort((a, b) => (b.created_at || "").localeCompare(a.created_at || ""));
+  return json({ aggregated_at: new Date().toISOString(), count: all.length, customers: all, per_product: results.map((r) => ({ slug: r.slug, ok: r.ok, status: r.status, count: (r.body as any)?.owner_count ?? null, error: r.error ?? null })) });
+}
+
+async function adminSupport(env: Env, _url: URL): Promise<Response> {
+  const results = await Promise.all(ADMIN_FANOUT_SLUGS.map((slug) => fanoutOne(env, slug, "/admin/list-support")));
+  const all: Array<{ ticket_id: string; product: string; email: string; subject: string; created_at: string }> = [];
+  for (const r of results) {
+    if (!r.ok || typeof r.body !== "object" || !r.body) continue;
+    const tickets = (r.body as any).tickets as Array<any> | undefined;
+    if (!tickets) continue;
+    for (const t of tickets) {
+      all.push({
+        ticket_id: t.ticket_id,
+        product: r.slug,
+        email: t.email,
+        subject: t.subject,
+        created_at: t.created_at,
+      });
+    }
+  }
+  all.sort((a, b) => (b.created_at || "").localeCompare(a.created_at || ""));
+  return json({ aggregated_at: new Date().toISOString(), count: all.length, tickets: all });
+}
+
+async function adminEvents(env: Env, _url: URL): Promise<Response> {
+  const results = await Promise.all(ADMIN_FANOUT_SLUGS.map((slug) => fanoutOne(env, slug, "/admin/list-events")));
+  const all: Array<{ product: string; type: string; at: string; data?: unknown }> = [];
+  for (const r of results) {
+    if (!r.ok || typeof r.body !== "object" || !r.body) continue;
+    const events = (r.body as any).events as Array<any> | undefined;
+    if (!events) continue;
+    for (const e of events) {
+      all.push({
+        product: r.slug,
+        type: e.type,
+        at: e.at,
+        data: e.data,
+      });
+    }
+  }
+  all.sort((a, b) => (b.at || "").localeCompare(a.at || ""));
+  return json({ aggregated_at: new Date().toISOString(), count: all.length, events: all.slice(0, 1000) });
+}
+
+async function adminStats(env: Env, _url: URL): Promise<Response> {
+  const results = await Promise.all(ADMIN_FANOUT_SLUGS.map((slug) => fanoutOne(env, slug, "/admin/list-keys")));
+  const tierCounts: Record<string, number> = { free: 0, solo: 0, team: 0, pro: 0 };
+  const perProduct: Array<{ slug: string; owner_count: number; tiers: Record<string, number>; estimated_monthly_revenue_usd: number }> = [];
+  let totalEstRevenue = 0;
+  for (const r of results) {
+    if (!r.ok || typeof r.body !== "object" || !r.body) {
+      perProduct.push({ slug: r.slug, owner_count: 0, tiers: { free: 0, solo: 0, team: 0, pro: 0 }, estimated_monthly_revenue_usd: 0 });
+      continue;
+    }
+    const owners = (r.body as any).owners as Array<any> | undefined;
+    const pt: Record<string, number> = { free: 0, solo: 0, team: 0, pro: 0 };
+    let revenue = 0;
+    if (owners) {
+      for (const o of owners) {
+        const t = String(o.tier ?? "free");
+        if (t in pt) pt[t]++; else pt[t] = (pt[t] ?? 0) + 1;
+        if (t in tierCounts) tierCounts[t]++; else tierCounts[t] = (tierCounts[t] ?? 0) + 1;
+        if (o.status === "active") revenue += TIER_MONTHLY_PRICE[t] ?? 0;
+      }
+    }
+    perProduct.push({
+      slug: r.slug,
+      owner_count: owners?.length ?? 0,
+      tiers: pt,
+      estimated_monthly_revenue_usd: revenue,
+    });
+    totalEstRevenue += revenue;
+  }
+  return json({
+    aggregated_at: new Date().toISOString(),
+    tier_counts: tierCounts,
+    total_subscribers: Object.values(tierCounts).reduce((a, b) => a + b, 0),
+    estimated_monthly_revenue_usd: totalEstRevenue,
+    per_product: perProduct,
+    note: "Revenue is estimated using the canonical $9/$29/$79 band; products with custom pricing bands will deviate.",
+  });
+}
+
+function adminLandingPage(): string {
+  return shell("Admin — mcp-hub", `
+<h1>Operator Admin</h1>
+<p class="muted">Gated by <code>Authorization: Bearer &lt;ADMIN_TOKEN&gt;</code>. All data is read live from each product's KV via service bindings.</p>
+<h2>Dashboards</h2>
+<ul>
+  <li><a href="/admin/customers"><code>/admin/customers</code></a> — every API key + tier + email across all 17 products.</li>
+  <li><a href="/admin/support"><code>/admin/support</code></a> — pending support tickets across the portfolio.</li>
+  <li><a href="/admin/events"><code>/admin/events</code></a> — recent webhook event log.</li>
+  <li><a href="/admin/stats"><code>/admin/stats</code></a> — subscriber counts per tier + monthly revenue estimate.</li>
+  <li><a href="/admin/backup-now"><code>/admin/backup-now</code></a> — manually run the daily KV → R2 backup.</li>
+</ul>
+<h2>Daily backup</h2>
+<p>Cron <code>0 3 * * *</code> dumps each product's KV (keys / support tickets / events) to R2 bucket <code>mcp-portfolio-backups</code> as <code>backups/YYYY-MM-DD/&lt;slug&gt;.json.gz</code>. 30-day rolling retention.</p>
+`);
+}
+
+// ── R2 backup ────────────────────────────────────────────────────────────────
+
+interface BackupResult {
+  ran_at: string;
+  date: string;
+  uploaded: Array<{ slug: string; key: string; bytes: number; ok: boolean; error?: string }>;
+  skipped_reason?: string;
+}
+
+async function runDailyBackup(env: Env): Promise<BackupResult> {
+  const date = new Date().toISOString().slice(0, 10);
+  const ran_at = new Date().toISOString();
+  if (!env.BACKUPS) {
+    return { ran_at, date, uploaded: [], skipped_reason: "BACKUPS R2 binding not configured" };
+  }
+  if (!env.ADMIN_TOKEN) {
+    return { ran_at, date, uploaded: [], skipped_reason: "ADMIN_TOKEN secret missing" };
+  }
+  const uploaded: BackupResult["uploaded"] = [];
+  for (const slug of ADMIN_FANOUT_SLUGS) {
+    const [keys, support, events] = await Promise.all([
+      fanoutOne(env, slug, "/admin/list-keys"),
+      fanoutOne(env, slug, "/admin/list-support"),
+      fanoutOne(env, slug, "/admin/list-events"),
+    ]);
+    const payload = JSON.stringify({
+      product: slug,
+      backed_up_at: ran_at,
+      keys: keys.body ?? { error: keys.error },
+      support: support.body ?? { error: support.error },
+      events: events.body ?? { error: events.error },
+    });
+    const gz = await gzipString(payload);
+    const objectKey = `backups/${date}/${slug}.json.gz`;
+    try {
+      await env.BACKUPS.put(objectKey, gz, {
+        httpMetadata: { contentType: "application/json", contentEncoding: "gzip" },
+      });
+      uploaded.push({ slug, key: objectKey, bytes: gz.byteLength, ok: true });
+    } catch (e: any) {
+      uploaded.push({ slug, key: objectKey, bytes: gz.byteLength, ok: false, error: e?.message ?? "r2 put failed" });
+    }
+  }
+  return { ran_at, date, uploaded };
+}
+
+async function gzipString(s: string): Promise<Uint8Array> {
+  const enc = new TextEncoder().encode(s);
+  const cs = new CompressionStream("gzip");
+  const writer = cs.writable.getWriter();
+  void writer.write(enc);
+  void writer.close();
+  const buf = await new Response(cs.readable).arrayBuffer();
+  return new Uint8Array(buf);
+}
 
 function sitemapXml(): string {
   const base = HUB_URL;

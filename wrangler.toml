@@ -10,9 +10,21 @@ enabled = true
 binding = "STATUS_KV"
 id = "52045936a14c405ea446f1722f60827b"
 
-# Cron trigger — ping all 18 products every 5 minutes.
+# R2 bucket for daily KV → R2 backups (cron 0 3 * * *).
+# Uncomment after enabling R2 in the Cloudflare Dashboard
+# (Storage → R2 → Enable). Bucket is created via:
+#   npx wrangler@latest r2 bucket create mcp-portfolio-backups
+# Until R2 is enabled, the cron handler skips uploads gracefully (the code
+# checks for env.BACKUPS at runtime).
+# [[r2_buckets]]
+# binding = "BACKUPS"
+# bucket_name = "mcp-portfolio-backups"
+
+# Cron triggers:
+#   */5 * * * *  health-check every 5 minutes (writes STATUS_KV)
+#   0   3 * * *  daily KV → R2 backup at 03:00 UTC
 [triggers]
-crons = ["*/5 * * * *"]
+crons = ["*/5 * * * *", "0 3 * * *"]
 
 # Service bindings to every sibling product Worker. Required because
 # intra-account `*.workers.dev` fetches are intercepted by the CF edge and
